@@ -358,13 +358,6 @@ static int precompile_enq_all_specializations__(jl_typemap_entry_t *def, void *c
             if (mi != NULL)
                 precompile_enq_specialization_(mi, closure);
         }
-        specializations = def->func.method->linearspecializations;
-        l = jl_svec_len(specializations);
-        for (i = 0; i < l; i++) {
-            jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-            if (mi != NULL)
-                precompile_enq_specialization_(mi, closure);
-        }
     }
     return 1;
 }

@@ -1089,8 +1089,6 @@ Base.return_types(f21933, (Val{1},))
 function count_specializations(method::Method)
     specs = method.specializations
     n = sum(i -> isassigned(specs, i), 0:length(specs))
-    specs = method.linearspecializations
-    n += sum(i -> isassigned(specs, i), 0:length(specs))
     return n
 end
 

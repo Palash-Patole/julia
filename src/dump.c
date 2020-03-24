@@ -851,7 +851,7 @@ static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v, int as_li
         assert((jl_value_t*)mt != jl_nothing);
         external_mt = !module_in_worklist(mt->module);
         jl_serialize_value(s, m->specializations);
-        jl_serialize_value(s, m->linearspecializations);
+        jl_serialize_value(s, m->speckeyset);
         jl_serialize_value(s, (jl_value_t*)m->name);
         jl_serialize_value(s, (jl_value_t*)m->file);
         write_int32(s->s, m->line);
@@ -1161,13 +1161,6 @@ static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) 
     else {
         jl_svec_t *specializations = m->specializations;
         size_t i, l = jl_svec_len(specializations);
-        for (i = 0; i < l; i++) {
-            jl_method_instance_t *callee = (jl_method_instance_t*)jl_svecref(specializations, i);
-            if (callee != NULL)
-                collect_backedges(callee);
-        }
-        specializations = m->linearspecializations;
-        l = jl_svec_len(specializations);
         for (i = 0; i < l; i++) {
             jl_method_instance_t *callee = (jl_method_instance_t*)jl_svecref(specializations, i);
             if (callee != NULL)
@@ -1727,8 +1720,8 @@ static jl_value_t *jl_deserialize_value_method(jl_serializer_state *s, jl_value_
     }
     m->specializations = (jl_svec_t*)jl_deserialize_value(s, (jl_value_t**)&m->specializations);
     jl_gc_wb(m, m->specializations);
-    m->linearspecializations = (jl_svec_t*)jl_deserialize_value(s, (jl_value_t**)&m->linearspecializations);
-    jl_gc_wb(m, m->linearspecializations);
+    m->speckeyset = (jl_array_t*)jl_deserialize_value(s, (jl_value_t**)&m->speckeyset);
+    jl_gc_wb(m, m->speckeyset);
     m->name = (jl_sym_t*)jl_deserialize_value(s, NULL);
     jl_gc_wb(m, m->name);
     m->file = (jl_sym_t*)jl_deserialize_value(s, NULL);

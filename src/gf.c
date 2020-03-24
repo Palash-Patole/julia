@@ -86,17 +86,20 @@ static int8_t jl_cachearg_offset(jl_methtable_t *mt)
 
 /// ----- Insertion logic for special entries ----- ///
 
-static uint_t speccache_hash(jl_value_t *ml)
+
+static uint_t speccache_hash(size_t idx, jl_svec_t *data)
 {
-    jl_value_t *sig = ((jl_method_instance_t*)ml)->specTypes;
+    jl_method_instance_t *ml = (jl_method_instance_t*)jl_svecref(data, idx);
+    jl_value_t *sig = ml->specTypes;
     if (jl_is_unionall(sig))
         sig = jl_unwrap_unionall(sig);
     return ((jl_datatype_t*)sig)->hash;
 }
 
-static int speccache_eq(jl_value_t *ml, const void *ty, uint_t hv)
+static int speccache_eq(size_t idx, const void *ty, jl_svec_t *data, uint_t hv)
 {
-    jl_value_t *sig = ((jl_method_instance_t*)ml)->specTypes;
+    jl_method_instance_t *ml = (jl_method_instance_t*)jl_svecref(data, idx);
+    jl_value_t *sig = ml->specTypes;
     if (ty == sig)
         return 1;
     uint_t h2 = ((jl_datatype_t*)(jl_is_unionall(sig) ? jl_unwrap_unionall(sig) : sig))->hash;
@@ -109,91 +112,88 @@ static int speccache_eq(jl_value_t *ml, const void *ty, uint_t hv)
 JL_DLLEXPORT jl_method_instance_t *jl_specializations_get_linfo(jl_method_t *m JL_PROPAGATES_ROOT, jl_value_t *type, jl_svec_t *sparams)
 {
     uint_t hv = ((jl_datatype_t*)(jl_is_unionall(type) ? jl_unwrap_unionall(type) : type))->hash;
-    if (hv) {
-        jl_method_instance_t *mi = (jl_method_instance_t*)jl_typeset_lookup(&m->specializations, speccache_eq, type, hv, jl_nothing);
-        if (jl_is_method_instance(mi))
-            return mi;
-    }
-    else {
-        jl_svec_t *linearcache = jl_atomic_load_relaxed(&m->linearspecializations);
-        jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(linearcache);
-        size_t i, cl = jl_svec_len(linearcache);
-        for (i = 0; i < cl; i++) {
-            jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
-            JL_GC_PROMISE_ROOTED(mi);
-            if (!mi)
-                break;
-            if (jl_types_equal(mi->specTypes, type))
-                return mi;
-        }
-    }
-    JL_LOCK(&m->writelock);
-    if (hv) {
-        jl_method_instance_t *mi = (jl_method_instance_t*)jl_typeset_lookup(&m->specializations, speccache_eq, type, hv, jl_nothing);
-        if (!jl_is_method_instance(mi)) {
-            mi = jl_get_specialized(m, type, sparams);
-            JL_GC_PUSH1(&mi);
-            // TODO: fuse lookup and insert steps?
-            jl_typeset_insert(&m->specializations, (jl_value_t*)m, speccache_hash, (jl_value_t*)mi);
-            JL_GC_PROMISE_ROOTED(mi); // clang-sa doesn't understand jl_typeset_insert
-            JL_GC_POP();
-        }
-        JL_UNLOCK(&m->writelock);
-        return mi;
-    }
-    else {
-        jl_svec_t *linearcache = jl_atomic_load_relaxed(&m->linearspecializations);
-        jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(linearcache);
-        size_t i, cl = jl_svec_len(linearcache);
-        for (i = 0; i < cl; i++) {
-            jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
-            JL_GC_PROMISE_ROOTED(mi);
-            if (!mi)
-                break;
-            if (jl_types_equal(mi->specTypes, type)) {
-                JL_UNLOCK(&m->writelock);
+    for (int locked = 0; ; locked++) {
+        jl_array_t *speckeyset = jl_atomic_load_acquire(&m->speckeyset);
+        jl_svec_t *specializations = jl_atomic_load_acquire(&m->specializations);
+        size_t i, cl = jl_svec_len(specializations);
+        if (hv) {
+            ssize_t idx = jl_smallintset_lookup(speckeyset, speccache_eq, type, specializations, hv);
+            if (idx != -1) {
+                jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, idx);
+                JL_GC_PROMISE_ROOTED(mi); // clang-sa doesn't understand jl_atomic_load_relaxed
+                if (locked)
+                    JL_UNLOCK(&m->writelock);
                 return mi;
             }
         }
-        if (i == cl) {
-            jl_svec_t *nc = jl_alloc_svec(cl < 8 ? 8 : (cl*3)>>1);
-            memcpy(jl_svec_data(nc), jl_svec_data(linearcache), sizeof(void*) * cl);
-            jl_atomic_store_release(&m->linearspecializations, nc);
-            JL_GC_PROMISE_ROOTED(nc); // clang-sa doesn't understand jl_atomic_store_release
-            jl_gc_wb(m, nc);
-            linearcache = nc;
-            cl = jl_svec_len(nc);
-            data = (jl_method_instance_t**)jl_svec_data(linearcache);
+        else {
+            jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(specializations);
+            for (i = cl; i > 0; i--) {
+                jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i - 1]);
+                JL_GC_PROMISE_ROOTED(mi); // clang-sa doesn't understand jl_atomic_load_relaxed
+                if (mi == NULL)
+                    break;
+                if (jl_types_equal(mi->specTypes, type)) {
+                    if (locked)
+                        JL_UNLOCK(&m->writelock);
+                    return mi;
+                }
+            }
         }
-        jl_method_instance_t *mi = jl_get_specialized(m, type, sparams);
-        jl_atomic_store_release(&data[i], mi);
-        jl_gc_wb(linearcache, mi);
-        JL_GC_PROMISE_ROOTED(mi); // clang-sa doesn't understand jl_atomic_store_release
-        JL_UNLOCK(&m->writelock);
-        return mi;
+        if (!sparams) // can't insert without knowing this
+            return NULL;
+        if (!locked) {
+            JL_LOCK(&m->writelock);
+        }
+        else {
+            if (hv) {
+                jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(specializations);
+                for (i = 0; i < cl; i++) {
+                    jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+                    if (mi == NULL)
+                        break;
+                }
+            }
+            jl_method_instance_t *mi = jl_get_specialized(m, type, sparams);
+            JL_GC_PUSH1(&mi);
+            if (hv ? (i + 1 >= cl || jl_svecref(specializations, i + 1) != NULL) : (i <= 1 || jl_svecref(specializations, i - 2) != NULL)) {
+                size_t ncl = cl < 8 ? 8 : (cl*3)>>1;
+                jl_svec_t *nc = jl_alloc_svec_uninit(ncl);
+                if (i > 0)
+                    memcpy((char*)jl_svec_data(nc), jl_svec_data(specializations), sizeof(void*) * i);
+                memset((char*)jl_svec_data(nc) + sizeof(void*) * i, 0, sizeof(void*) * (ncl - cl));
+                if (i < cl)
+                    memcpy((char*)jl_svec_data(nc) + sizeof(void*) * (i + ncl - cl),
+                           (char*)jl_svec_data(specializations) + sizeof(void*) * i,
+                           sizeof(void*) * (cl - i));
+                jl_atomic_store_release(&m->specializations, nc);
+                JL_GC_PROMISE_ROOTED(nc); // clang-sa doesn't understand jl_atomic_store_release
+                jl_gc_wb(m, nc);
+                specializations = nc;
+                if (!hv)
+                    i += ncl - cl;
+            }
+            if (!hv)
+                i -= 1;
+            assert(jl_svecref(specializations, i) == NULL);
+            jl_svecset(specializations, i, mi); // jl_atomic_store_release?
+            if (hv) {
+                // TODO: fuse lookup and insert steps?
+                jl_smallintset_insert(&m->speckeyset, (jl_value_t*)m, speccache_hash, i, specializations);
+            }
+            JL_UNLOCK(&m->writelock);
+            JL_GC_POP();
+            return mi;
+        }
     }
 }
 
 JL_DLLEXPORT jl_value_t *jl_specializations_lookup(jl_method_t *m, jl_value_t *type)
 {
-    uint_t hv = ((jl_datatype_t*)(jl_is_unionall(type) ? jl_unwrap_unionall(type) : type))->hash;
-    if (hv) {
-        return jl_typeset_lookup(&m->specializations, speccache_eq, type, hv, jl_nothing);
-    }
-    else {
-        jl_svec_t *linearcache = jl_atomic_load_relaxed(&m->linearspecializations);
-        jl_method_instance_t **data = (jl_method_instance_t**)jl_svec_data(linearcache);
-        size_t i, cl = jl_svec_len(linearcache);
-        for (i = 0; i < cl; i++) {
-            jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
-            JL_GC_PROMISE_ROOTED(mi);
-            if (!mi)
-                break;
-            if (jl_types_equal(mi->specTypes, type))
-                return (jl_value_t*)mi;
-        }
+    jl_value_t *mi = (jl_value_t*)jl_specializations_get_linfo(m, type, NULL);
+    if (mi == NULL)
         return jl_nothing;
-    }
+    return mi;
 }
 
 JL_DLLEXPORT jl_value_t *jl_methtable_lookup(jl_methtable_t *mt, jl_value_t *type, size_t world)
@@ -402,16 +402,6 @@ static int get_method_unspec_list(jl_typemap_entry_t *def, void *closure)
 {
     jl_svec_t *specializations = def->func.method->specializations;
     size_t i, l = jl_svec_len(specializations);
-    for (i = 0; i < l; i++) {
-        jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-        if (mi) {
-            assert(jl_is_method_instance(mi));
-            if (jl_rettype_inferred(mi, jl_world_counter, jl_world_counter) == jl_nothing)
-                jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)mi);
-        }
-    }
-    specializations = def->func.method->linearspecializations;
-    l = jl_svec_len(specializations);
     for (i = 0; i < l; i++) {
         jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
         if (mi) {
@@ -1686,13 +1676,6 @@ JL_DLLEXPORT void jl_method_table_disable(jl_methtable_t *mt, jl_method_t *metho
         if (mi)
             invalidate_backedges(mi, methodentry->max_world);
     }
-    specializations = methodentry->func.method->linearspecializations;
-    l = jl_svec_len(specializations);
-    for (i = 0; i < l; i++) {
-        jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-        if (mi)
-            invalidate_backedges(mi, methodentry->max_world);
-    }
     JL_UNLOCK(&mt->writelock);
 }
 
@@ -1778,14 +1761,6 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
                 m = ((jl_typemap_entry_t*)m)->func.value;
             jl_svec_t *specializations = ((jl_method_t*)m)->specializations;
             size_t i, l = jl_svec_len(specializations);
-            for (i = 0; i < l; i++) {
-                jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-                if (mi != NULL && !jl_has_empty_intersection(type, (jl_value_t*)mi->specTypes))
-                    if (invalidate_backedges(mi, max_world))
-                        invalidated = 1;
-            }
-            specializations = ((jl_method_t*)m)->linearspecializations;
-            l = jl_svec_len(specializations);
             for (i = 0; i < l; i++) {
                 jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
                 if (mi != NULL && !jl_has_empty_intersection(type, (jl_value_t*)mi->specTypes))
